@@ -1,0 +1,210 @@
+# Build the relay image, push it to ACR, and roll the tcpbroke Container App onto the new tag.
+# Same rollout Logic App as nbroke's deploy.yml - only IMAGE_NAME and CONTAINER_APPS differ, so
+# ACA_DEPLOY_LOGIC_APP_DATA is the identical value in both repos.
+#
+# ---------------------------------------------------------------------------------------------
+# REQUIRED REPOSITORY SECRETS  (Settings -> Secrets and variables -> Actions -> New repository secret)
+# ---------------------------------------------------------------------------------------------
+#   ACR_DEV_LOGIN_SERVER        ACR login server, e.g. myregistry.azurecr.io
+#   ACR_DEV_USERNAME            ACR admin username (Container registry -> Access keys)
+#   ACR_DEV_PASSWORD            ACR admin password
+#
+#   ACA_DEPLOY_LOGIC_APP_DATA   The whole rollout target as ONE JSON object. Paste it verbatim
+#                               (newlines are fine). url/password/subscriptionId are the same
+#                               wherever this Logic App is used; `containers` is this repo's own:
+#
+#                                 {
+#                                   "url": "https://prod-NN.<region>.logic.azure.com:443/workflows/<id>/triggers/Http_Request/paths/invoke?api-version=2016-10-01&sp=%2Ftriggers%2FHttp_Request%2Frun&sv=1.0&sig=<sig>",
+#                                   "password": "<the Logic App's authPassword parameter>",
+#                                   "subscriptionId": "<subscription GUID>",
+#                                   "resourceGroup": "<resource group holding the Container App>",
+#                                   "containers": ["tunnel-jv-rdp-repo"]
+#                                 }
+#
+#                               url        - full invoke URL INCLUDING the SAS query string. The
+#                                            sig is a bearer secret: anyone holding this URL can
+#                                            call the rollout. Rotate the trigger SAS if it leaks.
+#                               password   - checked by the Logic App's `If_Password_Valid`
+#                                            condition, which answers 401 on mismatch. Must match
+#                                            EXACTLY; rotate it in both places together.
+#                               containers - the Container Apps THIS repo deploys to. Entries are
+#                                            app names, or {"name","resourceGroup"} to put one in a
+#                                            different group from the top-level resourceGroup.
+#                                            Nothing cross-checks this list against IMAGE_NAME, so
+#                                            pasting nbroke's blob here would roll the tcpbroke
+#                                            image onto nbroke's twelve tunnels.
+#
+#                               Overridable per repo from the `env:` block below: RESOURCE_GROUP,
+#                               and CONTAINER_APPS (space separated) which wins over the secret.
+#                               Prefer the env override when you want a target change to show up in
+#                               the diff - editing a secret leaves no history and no review.
+#
+# NOTE: none of these are the tunnel's own key. TUNNEL_KEY is set on the Container App itself (the
+# relay refuses to start without it) and is never needed by CI.
+#
+# Everything in `env:` is plain configuration, deliberately NOT secret - a rollout should be
+# reviewable in the diff.
+# ---------------------------------------------------------------------------------------------
+
+name: build-and-push-acr
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: tcpbroke-server
+  # Target comes from .containers["tcpbroke-server"] in ACA_DEPLOY_LOGIC_APP_DATA - ONE Container
+  # App, which must stay single-replica (min=max=1): the relay keeps pairing state in process, so a
+  # second replica would serve a tunnel it does not have. Rolling it restarts the relay and drops
+  # the agent's control socket; the agent reconnects on its own within ~30s, but any live RDP
+  # session dies with the old revision.
+  # Uncomment to override the target here instead - it wins over the secret:
+  # CONTAINER_APPS: tunnel-jv-rdp-repo
+
+jobs:
+  build-and-push-to-ACR:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Generate timestamp
+      id: timestamp
+      run: echo "TIMESTAMP=$(TZ='Asia/Jakarta' date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+
+    - name: Login to ACR
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ secrets.ACR_DEV_LOGIN_SERVER }}
+        username: ${{ secrets.ACR_DEV_USERNAME }}
+        password: ${{ secrets.ACR_DEV_PASSWORD }}
+
+    - name: Build and push Docker image
+      run: |
+        docker build -f Dockerfile -t "${{ secrets.ACR_DEV_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.timestamp.outputs.TIMESTAMP }}" .
+        docker push ${{ secrets.ACR_DEV_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.timestamp.outputs.TIMESTAMP }}
+
+    - name: Roll out new image to Container Apps
+      env:
+        LOGIC_APP_DATA: ${{ secrets.ACA_DEPLOY_LOGIC_APP_DATA }}
+        ACR_LOGIN_SERVER: ${{ secrets.ACR_DEV_LOGIN_SERVER }}
+        IMAGE_TAG: ${{ steps.timestamp.outputs.TIMESTAMP }}
+      run: |
+        set -uo pipefail
+
+        # --- unpack the one deploy secret --------------------------------------------------
+        if ! printf '%s' "$LOGIC_APP_DATA" | jq -e . >/dev/null 2>&1; then
+          echo "::error::ACA_DEPLOY_LOGIC_APP_DATA is missing or is not valid JSON"
+          exit 1
+        fi
+        LOGIC_APP_URL="$(printf '%s' "$LOGIC_APP_DATA"   | jq -r '.url            // empty')"
+        DEPLOY_PASSWORD="$(printf '%s' "$LOGIC_APP_DATA" | jq -r '.password       // empty')"
+        SUBSCRIPTION_ID="$(printf '%s' "$LOGIC_APP_DATA" | jq -r '.subscriptionId // empty')"
+        RESOURCE_GROUP="${RESOURCE_GROUP:-$(printf '%s' "$LOGIC_APP_DATA" | jq -r '.resourceGroup // empty')}"
+
+        # GitHub masks the SECRET STRING, not values parsed out of it. Without these, the SAS sig
+        # and the password would print verbatim in any log line or error that echoes them.
+        for secret_value in "$LOGIC_APP_URL" "$DEPLOY_PASSWORD"; do
+          [ -n "$secret_value" ] && echo "::add-mask::$secret_value"
+        done
+
+        missing=""
+        [ -n "$LOGIC_APP_URL" ]   || missing="$missing url"
+        [ -n "$DEPLOY_PASSWORD" ] || missing="$missing password"
+        [ -n "$SUBSCRIPTION_ID" ] || missing="$missing subscriptionId"
+        [ -n "$RESOURCE_GROUP" ]  || missing="$missing resourceGroup"
+        if [ -n "$missing" ]; then
+          echo "::error::ACA_DEPLOY_LOGIC_APP_DATA is missing field(s):$missing"
+          exit 1
+        fi
+
+        # --- work out the targets ----------------------------------------------------------
+        # The Logic App expects `containers` as an array of objects: [{"name": "..."}, ...].
+        # Each item may also carry its own "resourceGroup"; omitted here, so they all inherit the
+        # top-level one.
+        #
+        # Source: CONTAINER_APPS from env: if set, otherwise the secret's `containers` list.
+        # List entries are plain app names, or objects carrying their own "resourceGroup".
+        if [ -n "${CONTAINER_APPS:-}" ]; then
+          containers="$(jq -cn --arg names "$CONTAINER_APPS" \
+            '$names | [splits("\\s+")] | map(select(length > 0) | {name: .})')"
+          source="env CONTAINER_APPS"
+        else
+          # The type guard keeps a malformed secret on the clear error below instead of a raw jq
+          # "Cannot index array with string"-style failure.
+          containers="$(printf '%s' "$LOGIC_APP_DATA" | jq -c '
+            (.containers // []) as $c
+            | (if ($c | type) == "array" then $c else [] end)
+            | map(if type == "string" then {name: .} else . end)')"
+          source="secret .containers"
+        fi
+
+        # Fail here rather than letting the Logic App answer an opaque 500: an empty list makes its
+        # foreach update nothing, leaving `updated` empty, which it reports as "All container
+        # updates failed" - indistinguishable from a real outage.
+        if [ "$(printf '%s' "$containers" | jq 'length')" = "0" ]; then
+          echo "::error::no target container apps - add a \"containers\" array to ACA_DEPLOY_LOGIC_APP_DATA, or set CONTAINER_APPS in env"
+          exit 1
+        fi
+
+        # --- build the rollout request -----------------------------------------------------
+        REGISTRY_NAME="${ACR_LOGIN_SERVER%%.*}"
+        echo "targets from: $source"
+        echo "rolling out ${IMAGE_NAME}:${IMAGE_TAG} into ${RESOURCE_GROUP}"
+        echo "targets: $(printf '%s' "$containers" | jq -r '[.[].name] | join(", ")')"
+
+        payload="$(jq -n \
+          --arg password        "$DEPLOY_PASSWORD" \
+          --arg registryName    "$REGISTRY_NAME" \
+          --arg acrLoginServer  "$ACR_LOGIN_SERVER" \
+          --arg imageRepository "$IMAGE_NAME" \
+          --arg imageTag        "$IMAGE_TAG" \
+          --arg subscriptionId  "$SUBSCRIPTION_ID" \
+          --arg resourceGroup   "$RESOURCE_GROUP" \
+          --argjson containers  "$containers" \
+          '{password:$password, registryName:$registryName, acrLoginServer:$acrLoginServer,
+            imageRepository:$imageRepository, imageTag:$imageTag, registryIdentity:"system",
+            subscriptionId:$subscriptionId, resourceGroup:$resourceGroup, containers:$containers}')"
+
+        http_code="$(curl -sS -o response.json -w '%{http_code}' --max-time 240 \
+          -X POST "$LOGIC_APP_URL" \
+          -H "Content-Type: application/json" \
+          -d "$payload" || echo timeout)"
+        echo "logic app status: $http_code"
+        cat response.json 2>/dev/null || true
+        echo
+
+        case "$http_code" in
+          2*)
+            # A 200 does NOT mean everything worked: the Logic App answers 200 when AT LEAST ONE
+            # app updated, and only 500 when they all failed. Inspect the arrays rather than
+            # trusting the status code.
+            updated="$(jq -r '(.updated // []) | length' response.json 2>/dev/null || echo 0)"
+            failed="$(jq -r '(.failed  // []) | length' response.json 2>/dev/null || echo 0)"
+            echo "updated=$updated failed=$failed"
+            if [ "$failed" != "0" ]; then
+              jq -r '.failed[]? | "  FAILED \(.name): \(.error)"' response.json || true
+              echo "::error::rollout failed for $failed container app(s)"
+              exit 1
+            fi
+            if [ "$updated" = "0" ]; then
+              echo "::error::rollout updated 0 container apps - check CONTAINER_APPS and the resourceGroup"
+              exit 1
+            fi
+            echo "rollout complete: $updated container app(s) now on $IMAGE_TAG"
+            ;;
+          401)
+            echo "::error::Logic App returned 401 - the \`password\` field does not match its authPassword parameter"
+            exit 1
+            ;;
+          504|timeout)
+            # The rollout runs synchronously and can overrun the gateway window. The run was
+            # accepted and is probably still working, but this job cannot confirm the outcome.
+            echo "::warning::Logic App did not answer in time; rollout was accepted but is UNVERIFIED - check the Container App revision"
+            ;;
+          *)
+            echo "::error::Logic App rejected the request (HTTP $http_code)"
+            exit 1
+            ;;
+        esac

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tcpbroke"
+version = "0.1.0"
+description = "Raw TCP reverse tunnel over a single outbound WSS connection"
+requires-python = ">=3.11"
+# Client deps only, so `pip install -e .` in the release workflow pulls exactly what the frozen
+# binary needs and nothing else. The server's extra deps live in the `server` extra below and in
+# requirements-server.txt (what the Dockerfile installs).
+dependencies = [
+    "websockets>=14,<16",
+    "certifi>=2024.2.2",
+]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+]
+
+[project.scripts]
+tcpbroke = "tcpbroke.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["tcpbroke*"]

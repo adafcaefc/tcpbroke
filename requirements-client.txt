@@ -1,0 +1,4 @@
+# Client (agent + listen modes). Kept deliberately tiny so the frozen exe stays small.
+websockets>=14,<16
+# The frozen build has no OS trust store to fall back on; certifi ships the CA bundle with it.
+certifi>=2024.2.2

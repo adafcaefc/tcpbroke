@@ -1,0 +1,106 @@
+name: release-nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install -e .
+
+      # Entry point is entrypoint_cli.py, NOT tcpbroke/cli/main.py. Unlike nbroke's, this CLI
+      # imports from its own package (`from ..protocol import ...`); handing PyInstaller the module
+      # file directly makes it a top-level script with no parent package, and the frozen binary
+      # dies on startup with "attempted relative import with no known parent package".
+      - name: Build Windows executable
+        run: pyinstaller --onefile --name tcpbroke --collect-data certifi --icon NONE entrypoint_cli.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tcpbroke-windows
+          path: dist/tcpbroke.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller
+          pip install -e .
+
+      - name: Build Linux binary
+        run: pyinstaller --onefile --name tcpbroke --collect-data certifi --icon NONE entrypoint_cli.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tcpbroke-linux
+          path: dist/tcpbroke
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tcpbroke-windows
+          path: artifacts/windows
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tcpbroke-linux
+          path: artifacts/linux
+
+      - name: Stage artifacts
+        run: |
+          mv artifacts/windows/tcpbroke.exe artifacts/tcpbroke-windows.exe
+          mv artifacts/linux/tcpbroke artifacts/tcpbroke-linux
+          chmod +x artifacts/tcpbroke-linux
+
+      - name: Delete existing nightly release
+        run: gh release delete nightly --yes --cleanup-tag || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          body: |
+            Automated build from `main`.
+
+            **Commit:** ${{ github.sha }}
+            **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Both binaries carry every mode - `agent` on the machine being reached,
+            `listen` on the machine doing the reaching.
+
+            | File | Platform |
+            |------|----------|
+            | `tcpbroke-windows.exe` | Windows x64 |
+            | `tcpbroke-linux` | Linux x64 |
+          files: |
+            artifacts/tcpbroke-windows.exe
+            artifacts/tcpbroke-linux
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

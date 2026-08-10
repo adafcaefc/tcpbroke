@@ -1,0 +1,29 @@
+# The image needs only requirements-server.txt + the tcpbroke package (see Dockerfile). Everything
+# else is client-side, CI, or local cruft - keeping it out shrinks the build context and stops a
+# stray .env from ever being baked into a layer.
+.git/
+.github/
+.gitignore
+.dockerignore
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
+# Secrets never belong in an image layer.
+.env
+*.env
+
+# Client-only / not needed at runtime.
+entrypoint_cli.py
+packaging/
+tests/
+requirements-client.txt
+requirements-dev.txt
+README.md
+.env.example
